@@ -13,6 +13,31 @@
 **/
 #include "ad5940.h"
 
+/* ---------------------------------------------------------------------------
+ * LOCAL MODIFICATION (memestat fork): bound every poll of AFE hardware.
+ *
+ * Upstream spin-waits on status bits with a bare `while(cond);`. If the AFE never
+ * answers — dead board, absent crystal, or oscillator-enable writes that were
+ * recorded-but-not-executed under SEQGen — the loop never exits and Core1 wedges
+ * with no way out. Not hypothetical: the driver repo records CLKCfg hanging in
+ * exactly this way (swv_seq.c, "gen_init_seq's old SEQGen-recorded
+ * AD5940_CLKCfg HUNG ... validated on the bench"), mitigated only by avoiding
+ * the call rather than by fixing it.
+ *
+ * One iteration is one SPI status read plus AD5940_Delay10us(1), so the guard is
+ * ~10 us per iteration and AD5940_SPIN_GUARD is ~1 s of real time. Callers supply
+ * the bail-out, which is always AD5940ERR_TIMEOUT — a code upstream already
+ * defines (ad5940.h, AD5940ERR_TIMEOUT = -10).
+ * ------------------------------------------------------------------------- */
+#define AD5940_SPIN_GUARD 100000u
+#define AD5940_SPIN_WAIT(cond, on_timeout) do {   \
+    uint32_t _spin = AD5940_SPIN_GUARD;           \
+    while (cond) {                                \
+      if (--_spin == 0u) { on_timeout; }          \
+      AD5940_Delay10us(1);                        \
+    }                                             \
+  } while (0)
+
 /*! \mainpage AD5940 Library Introduction
  * 
  * ![AD5940 EVAL Board](https://www.analog.com/-/media/analog/en/evaluation-board-images/images/eval-ad5940elcztop-web.gif?h=500&thn=1&hash=1F38F7CC1002894616F74D316365C0A2631C432B "ADI logo") 
@@ -2496,9 +2521,14 @@ AD5940Err AD5940_RAM_FN(AD5940_WUPTTime)(uint32_t SeqId, uint32_t SleepTime, uin
  * @param pClkCfg: Pointer to configuration structure.
  * @return return none.
 */
-void AD5940_RAM_FN(AD5940_CLKCfg)(CLKCfg_Type *pClkCfg)
+/* LOCAL MODIFICATION: was `void`. Returns AD5940ERR_TIMEOUT if an oscillator never
+ * reports ready. Source-compatible — callers that ignore the return still compile.
+ * On timeout it returns BEFORE the clock switch below, deliberately: switching the
+ * system clock onto an oscillator that never came ready is worse than not switching. */
+AD5940Err AD5940_RAM_FN(AD5940_CLKCfg)(CLKCfg_Type *pClkCfg)
 {
   uint32_t tempreg, reg_osccon;
+  AD5940Err err;
 
   reg_osccon = AD5940_ReadReg(REG_ALLON_OSCCON);
   /* Enable clocks */
@@ -2507,7 +2537,8 @@ void AD5940_RAM_FN(AD5940_CLKCfg)(CLKCfg_Type *pClkCfg)
     reg_osccon |= BITM_ALLON_OSCCON_HFXTALEN;
     AD5940_WriteReg(REG_ALLON_OSCKEY,KEY_OSCCON); /* Write Key */
     AD5940_WriteReg(REG_ALLON_OSCCON, reg_osccon); /* Enable HFXTAL */
-    while((AD5940_ReadReg(REG_ALLON_OSCCON)&BITM_ALLON_OSCCON_HFXTALOK) == 0); /* Wait for clock ready */
+    AD5940_SPIN_WAIT((AD5940_ReadReg(REG_ALLON_OSCCON)&BITM_ALLON_OSCCON_HFXTALOK) == 0,
+                     return AD5940ERR_TIMEOUT); /* Wait for clock ready */
   }
 
   if(pClkCfg->HFOSCEn == bTRUE)
@@ -2515,12 +2546,14 @@ void AD5940_RAM_FN(AD5940_CLKCfg)(CLKCfg_Type *pClkCfg)
     reg_osccon |= BITM_ALLON_OSCCON_HFOSCEN;
     AD5940_WriteReg(REG_ALLON_OSCKEY,KEY_OSCCON); /* Write Key */
     AD5940_WriteReg(REG_ALLON_OSCCON, reg_osccon); /* Enable HFOSC */
-    while((AD5940_ReadReg(REG_ALLON_OSCCON)&BITM_ALLON_OSCCON_HFOSCOK) == 0); /* Wait for clock ready */
+    AD5940_SPIN_WAIT((AD5940_ReadReg(REG_ALLON_OSCCON)&BITM_ALLON_OSCCON_HFOSCOK) == 0,
+                     return AD5940ERR_TIMEOUT); /* Wait for clock ready */
     /* Configure HFOSC mode if it's enabled. */
     if(pClkCfg->HfOSC32MHzMode  == bTRUE)
-      AD5940_HFOSC32MHzCtrl(bTRUE);
+      err = AD5940_HFOSC32MHzCtrl(bTRUE);
     else
-      AD5940_HFOSC32MHzCtrl(bFALSE);
+      err = AD5940_HFOSC32MHzCtrl(bFALSE);
+    if(err != AD5940ERR_OK) return err;   /* LOCAL: propagate, was discarded */
   }
 
   if(pClkCfg->LFOSCEn == bTRUE)
@@ -2528,7 +2561,8 @@ void AD5940_RAM_FN(AD5940_CLKCfg)(CLKCfg_Type *pClkCfg)
     reg_osccon |= BITM_ALLON_OSCCON_LFOSCEN;  
     AD5940_WriteReg(REG_ALLON_OSCKEY,KEY_OSCCON); /* Write Key */  
     AD5940_WriteReg(REG_ALLON_OSCCON, reg_osccon); /* Enable LFOSC */
-    while((AD5940_ReadReg(REG_ALLON_OSCCON)&BITM_ALLON_OSCCON_LFOSCOK) == 0); /* Wait for clock ready */
+    AD5940_SPIN_WAIT((AD5940_ReadReg(REG_ALLON_OSCCON)&BITM_ALLON_OSCCON_LFOSCOK) == 0,
+                     return AD5940ERR_TIMEOUT); /* Wait for clock ready */
   }
 
   /* Switch clocks */
@@ -2552,6 +2586,7 @@ void AD5940_RAM_FN(AD5940_CLKCfg)(CLKCfg_Type *pClkCfg)
     reg_osccon &= ~BITM_ALLON_OSCCON_LFOSCEN;
   AD5940_WriteReg(REG_ALLON_OSCKEY, KEY_OSCCON); /* Write Key */
   AD5940_WriteReg(REG_ALLON_OSCCON, reg_osccon);
+  return AD5940ERR_OK;
 }
 
 /**
@@ -2561,10 +2596,15 @@ void AD5940_RAM_FN(AD5940_CLKCfg)(CLKCfg_Type *pClkCfg)
  *        - bFALSE: HFOSC 16MHz mode.
  * @return return none.
 */
-void AD5940_RAM_FN(AD5940_HFOSC32MHzCtrl)(BoolFlag Mode32MHz)
+/* LOCAL MODIFICATION: was `void`. Returns AD5940ERR_TIMEOUT if HFOSC never reports
+ * ready. Note the timeout does NOT return early — it breaks out of the spin and
+ * falls through to the ACLK re-enable below. Returning from inside the if/else
+ * would leave ACLK disabled, which is a worse state than the hang this replaces. */
+AD5940Err AD5940_RAM_FN(AD5940_HFOSC32MHzCtrl)(BoolFlag Mode32MHz)
 {
   uint32_t RdCLKEN1;
-  uint32_t RdHPOSCCON;   
+  uint32_t RdHPOSCCON;
+  AD5940Err err = AD5940ERR_OK;
 
   uint32_t bit8,bit9;
     
@@ -2578,16 +2618,19 @@ void AD5940_RAM_FN(AD5940_HFOSC32MHzCtrl)(BoolFlag Mode32MHz)
   RdHPOSCCON = AD5940_ReadReg(REG_AFE_HPOSCCON); 
   if(Mode32MHz == bTRUE)
   {
-    AD5940_WriteReg(REG_AFE_HPOSCCON,RdHPOSCCON&(~BITM_AFE_HPOSCCON_CLK32MHZEN)); /* Enable 32MHz output(bit definition-0: 32MHz, 1: 16MHz) */  
-    while((AD5940_ReadReg(REG_ALLON_OSCCON)&BITM_ALLON_OSCCON_HFOSCOK) == 0); /* Wait for clock ready */
+    AD5940_WriteReg(REG_AFE_HPOSCCON,RdHPOSCCON&(~BITM_AFE_HPOSCCON_CLK32MHZEN)); /* Enable 32MHz output(bit definition-0: 32MHz, 1: 16MHz) */
+    AD5940_SPIN_WAIT((AD5940_ReadReg(REG_ALLON_OSCCON)&BITM_ALLON_OSCCON_HFOSCOK) == 0,
+                     { err = AD5940ERR_TIMEOUT; break; }); /* Wait for clock ready */
   }
   else
   {
-    AD5940_WriteReg(REG_AFE_HPOSCCON,RdHPOSCCON|BITM_AFE_HPOSCCON_CLK32MHZEN); /* Enable 16MHz output(bit definition-0: 32MHz, 1: 16MHz) */       
-    while((AD5940_ReadReg(REG_ALLON_OSCCON)&BITM_ALLON_OSCCON_HFOSCOK) == 0); /* Wait for clock ready */
+    AD5940_WriteReg(REG_AFE_HPOSCCON,RdHPOSCCON|BITM_AFE_HPOSCCON_CLK32MHZEN); /* Enable 16MHz output(bit definition-0: 32MHz, 1: 16MHz) */
+    AD5940_SPIN_WAIT((AD5940_ReadReg(REG_ALLON_OSCCON)&BITM_ALLON_OSCCON_HFOSCOK) == 0,
+                     { err = AD5940ERR_TIMEOUT; break; }); /* Wait for clock ready */
   }
 
   AD5940_WriteReg(REG_AFECON_CLKEN1,RdCLKEN1&(~BITM_AFECON_CLKEN1_ACLKDIS)); /* Enable ACLK */
+  return err;
 }
 /**
  * @brief Enable high power mode for high frequency EIS
@@ -3553,7 +3596,8 @@ AD5940Err AD5940_RAM_FN(AD5940_HSRtiaCal)(HSRTIACal_Type *pCalCfg, void *pResult
   AD5940_Delay10us(25);
   AD5940_AFECtrlS(AFECTRL_ADCCNV|AFECTRL_DFT, bTRUE);  /* Start ADC convert and DFT */
   /* Wait until DFT ready */
-  while(AD5940_INTCTestFlag(AFEINTC_1, AFEINTSRC_DFTRDY) == bFALSE);  
+  AD5940_SPIN_WAIT(AD5940_INTCTestFlag(AFEINTC_1, AFEINTSRC_DFTRDY) == bFALSE,
+                     return AD5940ERR_TIMEOUT);  
   AD5940_AFECtrlS(AFECTRL_ADCCNV|AFECTRL_DFT|AFECTRL_WG|AFECTRL_ADCPWR, bFALSE);  /* Stop ADC convert and DFT */
   AD5940_INTCClrFlag(AFEINTSRC_DFTRDY);
   
@@ -3567,7 +3611,8 @@ AD5940Err AD5940_RAM_FN(AD5940_HSRtiaCal)(HSRTIACal_Type *pCalCfg, void *pResult
   AD5940_Delay10us(25);
   AD5940_AFECtrlS(AFECTRL_ADCCNV|AFECTRL_DFT, bTRUE);  /* Start ADC convert and DFT */
   /* Wait until DFT ready */
-  while(AD5940_INTCTestFlag(AFEINTC_1, AFEINTSRC_DFTRDY) == bFALSE);  
+  AD5940_SPIN_WAIT(AD5940_INTCTestFlag(AFEINTC_1, AFEINTSRC_DFTRDY) == bFALSE,
+                     return AD5940ERR_TIMEOUT);  
   AD5940_AFECtrlS(AFECTRL_ADCCNV|AFECTRL_DFT|AFECTRL_WG|AFECTRL_ADCPWR, bFALSE);  /* Stop ADC convert and DFT */
   AD5940_INTCClrFlag(AFEINTSRC_DFTRDY);
 
@@ -3784,7 +3829,7 @@ AD5940Err AD5940_RAM_FN(AD5940_LPRtiaCal)(LPRTIACal_Type *pCalCfg, void *pResult
   hs_loop.SWMatCfg.Tswitch = SWT_TRTIA|SWT_RCAL1;
   if(bDCMode)
   {
-    int32_t time_out = -1;    /* Always wait. */
+    int32_t time_out = AD5940_SPIN_GUARD;  /* LOCAL: was -1 ("Always wait") */
     int32_t offset_rcal, offset_rtia;  
     /* Configure WG */
     hs_loop.WgCfg.WgType = WGTYPE_MMR;
@@ -3807,7 +3852,9 @@ AD5940Err AD5940_RAM_FN(AD5940_LPRtiaCal)(LPRTIACal_Type *pCalCfg, void *pResult
     pADCBaseCfg->ADCPga = ADCPgaGainRcal;
     AD5940_ADCBaseCfgS(pADCBaseCfg);
     AD5940_Delay10us(50);   /* Wait some time here. */
+    time_out = AD5940_SPIN_GUARD;   /* LOCAL: reset budget, per file idiom */
     offset_rcal = __AD5940_TakeMeasurement(&time_out);  /* Turn on ADC to get one valid data and then turn off ADC. */
+    if(time_out == 0) return AD5940ERR_TIMEOUT;   /* LOCAL: was unchecked */
     /* Measure RTIA channel voltage offset */
     if(pCalCfg->LpAmpSel == LPAMP0)
     {
@@ -3821,7 +3868,9 @@ AD5940Err AD5940_RAM_FN(AD5940_LPRtiaCal)(LPRTIACal_Type *pCalCfg, void *pResult
     pADCBaseCfg->ADCPga = ADCPgaGainRtia;    
     AD5940_ADCBaseCfgS(pADCBaseCfg);
     AD5940_Delay10us(50);   /* Wait some time here. */
+    time_out = AD5940_SPIN_GUARD;   /* LOCAL: reset budget, per file idiom */
     offset_rtia = __AD5940_TakeMeasurement(&time_out);  /* Turn on ADC to get one valid data and then turn off ADC. */
+    if(time_out == 0) return AD5940ERR_TIMEOUT;   /* LOCAL: was unchecked */
     /* Connect LPTIA loop, let current flow to RTIA. */
     pSWCfg->Dswitch = SWD_RCAL0|((pCalCfg->LpAmpSel == LPAMP0)?SWD_SE0:SWD_SE1);
     pSWCfg->Pswitch = SWP_RCAL0;
@@ -3836,7 +3885,9 @@ AD5940Err AD5940_RAM_FN(AD5940_LPRtiaCal)(LPRTIACal_Type *pCalCfg, void *pResult
     pADCBaseCfg->ADCPga = ADCPgaGainRcal;
     AD5940_ADCBaseCfgS(pADCBaseCfg);
     AD5940_Delay10us(50);   /* Wait some time here. */
+    time_out = AD5940_SPIN_GUARD;   /* LOCAL: reset budget, per file idiom */
     DftRcal.Real = (int32_t)__AD5940_TakeMeasurement(&time_out)- offset_rcal;
+    if(time_out == 0) return AD5940ERR_TIMEOUT;   /* LOCAL: was unchecked */
     DftRcal.Image = 0;
 		/* Measure RTIA */    
     if(pCalCfg->LpAmpSel == LPAMP0)
@@ -3851,7 +3902,9 @@ AD5940Err AD5940_RAM_FN(AD5940_LPRtiaCal)(LPRTIACal_Type *pCalCfg, void *pResult
     pADCBaseCfg->ADCPga = ADCPgaGainRtia;
     AD5940_ADCBaseCfgS(pADCBaseCfg);
     AD5940_Delay10us(50);   /* Wait some time here. */
+    time_out = AD5940_SPIN_GUARD;   /* LOCAL: reset budget, per file idiom */
     DftRtia.Real = (int32_t)__AD5940_TakeMeasurement(&time_out)- offset_rtia;
+    if(time_out == 0) return AD5940ERR_TIMEOUT;   /* LOCAL: was unchecked */
     DftRtia.Image = 0;
   }
   else
@@ -3879,7 +3932,8 @@ AD5940Err AD5940_RAM_FN(AD5940_LPRtiaCal)(LPRTIACal_Type *pCalCfg, void *pResult
     AD5940_Delay10us(25);
     AD5940_AFECtrlS(AFECTRL_ADCCNV|AFECTRL_DFT, bTRUE);
     /* Wait until DFT ready */
-    while(AD5940_INTCTestFlag(AFEINTC_1, AFEINTSRC_DFTRDY) == bFALSE);  
+    AD5940_SPIN_WAIT(AD5940_INTCTestFlag(AFEINTC_1, AFEINTSRC_DFTRDY) == bFALSE,
+                     return AD5940ERR_TIMEOUT);  
     AD5940_AFECtrlS(AFECTRL_ADCCNV|AFECTRL_DFT|AFECTRL_WG|AFECTRL_ADCPWR, bFALSE);  /* Stop ADC convert and DFT */
     AD5940_INTCClrFlag(AFEINTSRC_DFTRDY);
     DftRcal.Real = AD5940_ReadAfeResult(AFERESULT_DFTREAL);
@@ -3900,7 +3954,8 @@ AD5940Err AD5940_RAM_FN(AD5940_LPRtiaCal)(LPRTIACal_Type *pCalCfg, void *pResult
     AD5940_Delay10us(25);
     AD5940_AFECtrlS(AFECTRL_ADCCNV|AFECTRL_DFT, bTRUE);
     /* Wait until DFT ready */
-    while(AD5940_INTCTestFlag(AFEINTC_1, AFEINTSRC_DFTRDY) == bFALSE);  
+    AD5940_SPIN_WAIT(AD5940_INTCTestFlag(AFEINTC_1, AFEINTSRC_DFTRDY) == bFALSE,
+                     return AD5940ERR_TIMEOUT);  
     AD5940_AFECtrlS(AFECTRL_ADCCNV|AFECTRL_DFT|AFECTRL_WG|AFECTRL_ADCPWR, bFALSE);  /* Stop ADC convert and DFT */
     AD5940_INTCClrFlag(AFEINTSRC_DFTRDY);
     DftRtia.Real = AD5940_ReadAfeResult(AFERESULT_DFTREAL);
@@ -4383,7 +4438,8 @@ AD5940Err AD5940_RAM_FN(AD5940_LFOSCMeasure)(LFOSCMeasure_Type *pCfg, float *pFr
   AD5940_INTCClrFlag(AFEINTSRC_ENDSEQ);
   AD5940_WUPTCtrl(bTRUE);
   
-  while(AD5940_INTCTestFlag(AFEINTC_1, AFEINTSRC_ENDSEQ) == bFALSE);
+  AD5940_SPIN_WAIT(AD5940_INTCTestFlag(AFEINTC_1, AFEINTSRC_ENDSEQ) == bFALSE,
+                     return AD5940ERR_TIMEOUT);
   TimerCount = AD5940_SEQTimeOutRd();
   
   AD5940_WUPTCtrl(bFALSE);
@@ -4398,7 +4454,8 @@ AD5940Err AD5940_RAM_FN(AD5940_LFOSCMeasure)(LFOSCMeasure_Type *pCfg, float *pFr
 
   AD5940_INTCClrFlag(AFEINTSRC_ENDSEQ);
   AD5940_WUPTCtrl(bTRUE);
-  while(AD5940_INTCTestFlag(AFEINTC_1, AFEINTSRC_ENDSEQ) == bFALSE);
+  AD5940_SPIN_WAIT(AD5940_INTCTestFlag(AFEINTC_1, AFEINTSRC_ENDSEQ) == bFALSE,
+                     return AD5940ERR_TIMEOUT);
   TimerCount2 = AD5940_SEQTimeOutRd();
 	AD5940_INTCTestFlag(AFEINTC_0, AFEINTSRC_ENDSEQ);
 
