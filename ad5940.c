@@ -24,19 +24,41 @@
  * AD5940_CLKCfg HUNG ... validated on the bench"), mitigated only by avoiding
  * the call rather than by fixing it.
  *
- * One iteration is one SPI status read plus AD5940_Delay10us(1), so the guard is
- * ~10 us per iteration and AD5940_SPIN_GUARD is ~1 s of real time. Callers supply
- * the bail-out, which is always AD5940ERR_TIMEOUT — a code upstream already
- * defines (ad5940.h, AD5940ERR_TIMEOUT = -10).
+ * One iteration is one SPI status read plus AD5940_Delay10us(1). The 10 us delay
+ * is a floor, not the period: a 32-bit register read is a 6-byte SPI transaction
+ * plus CS framing, so a realistic iteration is 20-35 us and AD5940_SPIN_GUARD is
+ * ~2-3.5 s of wall clock, NOT the ~1 s an earlier version of this comment
+ * claimed. Sized to sit under the host's 5 s Core0 watchdog.
+ * Callers supply the bail-out, which is AD5940ERR_TIMEOUT — a code upstream
+ * already defines (ad5940.h, AD5940ERR_TIMEOUT = -10).
+ *
+ * The loop always EXITS once the guard expires, even if on_timeout neither
+ * returns nor breaks. An earlier form tested `--_spin == 0` and acted only on the
+ * exact zero crossing, so a logging-only on_timeout would wrap to 0xFFFFFFFF and
+ * spin ~12 h more. Fail closed, not open.
  * ------------------------------------------------------------------------- */
 #define AD5940_SPIN_GUARD 100000u
-#define AD5940_SPIN_WAIT(cond, on_timeout) do {   \
-    uint32_t _spin = AD5940_SPIN_GUARD;           \
+#define AD5940_SPIN_WAIT_N(cond, guard, on_timeout) do { \
+    uint32_t _spin = (guard);                     \
     while (cond) {                                \
-      if (--_spin == 0u) { on_timeout; }          \
+      if (_spin == 0u) { on_timeout; break; }     \
+      --_spin;                                    \
       AD5940_Delay10us(1);                        \
     }                                             \
   } while (0)
+#define AD5940_SPIN_WAIT(cond, on_timeout) \
+    AD5940_SPIN_WAIT_N(cond, AD5940_SPIN_GUARD, on_timeout)
+
+/* A DFT spin that times out must still stop the engine and CLEAR DFTRDY. Leaving
+ * the flag set makes the NEXT wait on DFTRDY exit on iteration 0 and read a stale
+ * result from the failed acquisition, so one timed-out calibration would silently
+ * poison the following one with plausible-looking numbers. */
+#define AD5940_DFT_TIMEOUT_BAIL()                                                     \
+    do {                                                                              \
+      AD5940_AFECtrlS(AFECTRL_ADCCNV|AFECTRL_DFT|AFECTRL_WG|AFECTRL_ADCPWR, bFALSE);   \
+      AD5940_INTCClrFlag(AFEINTSRC_DFTRDY);                                           \
+      return AD5940ERR_TIMEOUT;                                                       \
+    } while (0)
 
 /*! \mainpage AD5940 Library Introduction
  * 
@@ -2528,7 +2550,7 @@ AD5940Err AD5940_RAM_FN(AD5940_WUPTTime)(uint32_t SeqId, uint32_t SleepTime, uin
 AD5940Err AD5940_RAM_FN(AD5940_CLKCfg)(CLKCfg_Type *pClkCfg)
 {
   uint32_t tempreg, reg_osccon;
-  AD5940Err err;
+  AD5940Err err = AD5940ERR_OK;
 
   reg_osccon = AD5940_ReadReg(REG_ALLON_OSCCON);
   /* Enable clocks */
@@ -2553,7 +2575,13 @@ AD5940Err AD5940_RAM_FN(AD5940_CLKCfg)(CLKCfg_Type *pClkCfg)
       err = AD5940_HFOSC32MHzCtrl(bTRUE);
     else
       err = AD5940_HFOSC32MHzCtrl(bFALSE);
-    if(err != AD5940ERR_OK) return err;   /* LOCAL: propagate, was discarded */
+    /* Do NOT return here. AD5940_HFOSC32MHzCtrl has ALREADY committed the
+     * HPOSCCON frequency change before its own spin, and the divider writes in
+     * "Switch clocks" below are what compensate for it -- AD5940_HPModeEn pairs
+     * HfOSC32MHzMode=bTRUE with SysClkDiv=SYSCLKDIV_2, and divide-by-2 is
+     * mandatory in 32 MHz mode. Bailing out here would leave the part clocked at
+     * 32 MHz with divide-by-1 -- out of spec, silently, since AD5940_HPModeEn is
+     * void and discards this error. Remember it and finish programming. */
   }
 
   if(pClkCfg->LFOSCEn == bTRUE)
@@ -2586,7 +2614,7 @@ AD5940Err AD5940_RAM_FN(AD5940_CLKCfg)(CLKCfg_Type *pClkCfg)
     reg_osccon &= ~BITM_ALLON_OSCCON_LFOSCEN;
   AD5940_WriteReg(REG_ALLON_OSCKEY, KEY_OSCCON); /* Write Key */
   AD5940_WriteReg(REG_ALLON_OSCCON, reg_osccon);
-  return AD5940ERR_OK;
+  return err;   /* OK unless HFOSC32MHzCtrl timed out above */
 }
 
 /**
@@ -3597,7 +3625,7 @@ AD5940Err AD5940_RAM_FN(AD5940_HSRtiaCal)(HSRTIACal_Type *pCalCfg, void *pResult
   AD5940_AFECtrlS(AFECTRL_ADCCNV|AFECTRL_DFT, bTRUE);  /* Start ADC convert and DFT */
   /* Wait until DFT ready */
   AD5940_SPIN_WAIT(AD5940_INTCTestFlag(AFEINTC_1, AFEINTSRC_DFTRDY) == bFALSE,
-                     return AD5940ERR_TIMEOUT);  
+                     AD5940_DFT_TIMEOUT_BAIL());  
   AD5940_AFECtrlS(AFECTRL_ADCCNV|AFECTRL_DFT|AFECTRL_WG|AFECTRL_ADCPWR, bFALSE);  /* Stop ADC convert and DFT */
   AD5940_INTCClrFlag(AFEINTSRC_DFTRDY);
   
@@ -3612,7 +3640,7 @@ AD5940Err AD5940_RAM_FN(AD5940_HSRtiaCal)(HSRTIACal_Type *pCalCfg, void *pResult
   AD5940_AFECtrlS(AFECTRL_ADCCNV|AFECTRL_DFT, bTRUE);  /* Start ADC convert and DFT */
   /* Wait until DFT ready */
   AD5940_SPIN_WAIT(AD5940_INTCTestFlag(AFEINTC_1, AFEINTSRC_DFTRDY) == bFALSE,
-                     return AD5940ERR_TIMEOUT);  
+                     AD5940_DFT_TIMEOUT_BAIL());  
   AD5940_AFECtrlS(AFECTRL_ADCCNV|AFECTRL_DFT|AFECTRL_WG|AFECTRL_ADCPWR, bFALSE);  /* Stop ADC convert and DFT */
   AD5940_INTCClrFlag(AFEINTSRC_DFTRDY);
 
@@ -3933,7 +3961,7 @@ AD5940Err AD5940_RAM_FN(AD5940_LPRtiaCal)(LPRTIACal_Type *pCalCfg, void *pResult
     AD5940_AFECtrlS(AFECTRL_ADCCNV|AFECTRL_DFT, bTRUE);
     /* Wait until DFT ready */
     AD5940_SPIN_WAIT(AD5940_INTCTestFlag(AFEINTC_1, AFEINTSRC_DFTRDY) == bFALSE,
-                     return AD5940ERR_TIMEOUT);  
+                     AD5940_DFT_TIMEOUT_BAIL());  
     AD5940_AFECtrlS(AFECTRL_ADCCNV|AFECTRL_DFT|AFECTRL_WG|AFECTRL_ADCPWR, bFALSE);  /* Stop ADC convert and DFT */
     AD5940_INTCClrFlag(AFEINTSRC_DFTRDY);
     DftRcal.Real = AD5940_ReadAfeResult(AFERESULT_DFTREAL);
@@ -3955,7 +3983,7 @@ AD5940Err AD5940_RAM_FN(AD5940_LPRtiaCal)(LPRTIACal_Type *pCalCfg, void *pResult
     AD5940_AFECtrlS(AFECTRL_ADCCNV|AFECTRL_DFT, bTRUE);
     /* Wait until DFT ready */
     AD5940_SPIN_WAIT(AD5940_INTCTestFlag(AFEINTC_1, AFEINTSRC_DFTRDY) == bFALSE,
-                     return AD5940ERR_TIMEOUT);  
+                     AD5940_DFT_TIMEOUT_BAIL());  
     AD5940_AFECtrlS(AFECTRL_ADCCNV|AFECTRL_DFT|AFECTRL_WG|AFECTRL_ADCPWR, bFALSE);  /* Stop ADC convert and DFT */
     AD5940_INTCClrFlag(AFEINTSRC_DFTRDY);
     DftRtia.Real = AD5940_ReadAfeResult(AFERESULT_DFTREAL);
@@ -4401,6 +4429,19 @@ AD5940Err AD5940_RAM_FN(AD5940_LFOSCMeasure)(LFOSCMeasure_Type *pCfg, float *pFr
     return AD5940ERR_PARA;
   AD5940_SEQGetCfg(&seq_cfg_backup);
   INTCCfg = AD5940_INTCGetCfg(AFEINTC_1);
+  /* Mirrors this function's own teardown. A timeout that just returned would
+   * leave the wakeup timer running -- re-triggering the sequences this function
+   * loaded, forever, after it returned -- and leave the caller's sequencer cfg
+   * and ENDSEQ interrupt mask overwritten. Strictly worse than the hang. */
+  #define LFOSC_TIMEOUT_BAIL()                                                     \
+      do {                                                                         \
+        AD5940_WUPTCtrl(bFALSE);                                                   \
+        AD5940_SEQCfg(&seq_cfg_backup);                                            \
+        AD5940_INTCCfg(AFEINTC_1, AFEINTSRC_ENDSEQ,                                \
+                       (INTCCfg&AFEINTSRC_ENDSEQ)?bTRUE:bFALSE);                   \
+        AD5940_INTCClrFlag(AFEINTSRC_ENDSEQ);                                      \
+        return AD5940ERR_TIMEOUT;                                                  \
+      } while (0)
   AD5940_INTCCfg(AFEINTC_1, AFEINTSRC_ENDSEQ, bTRUE);
 	AD5940_INTCClrFlag(AFEINTSRC_ALLINT);
 
@@ -4438,8 +4479,18 @@ AD5940Err AD5940_RAM_FN(AD5940_LFOSCMeasure)(LFOSCMeasure_Type *pCfg, float *pFr
   AD5940_INTCClrFlag(AFEINTSRC_ENDSEQ);
   AD5940_WUPTCtrl(bTRUE);
   
-  AD5940_SPIN_WAIT(AD5940_INTCTestFlag(AFEINTC_1, AFEINTSRC_ENDSEQ) == bFALSE,
-                     return AD5940ERR_TIMEOUT);
+  /* CALLER-PARAMETERISED wait: SeqxSleepTime[0] above is CalDuration*32 LFOSC
+   * ticks, so this spin must last CalDuration milliseconds. The fixed
+   * AD5940_SPIN_GUARD would fire spuriously on healthy hardware for any
+   * CalDuration the API permits -- validation only rejects < 1 ms and ADI's own
+   * examples use ~1000 ms. Derive it: ~100 iterations/ms, doubled for margin,
+   * floored at the default. */
+  {
+    const uint32_t lfosc_guard =
+        (uint32_t)(pCfg->CalDuration * 200.0f) + AD5940_SPIN_GUARD;
+    AD5940_SPIN_WAIT_N(AD5940_INTCTestFlag(AFEINTC_1, AFEINTSRC_ENDSEQ) == bFALSE,
+                       lfosc_guard, LFOSC_TIMEOUT_BAIL());
+  }
   TimerCount = AD5940_SEQTimeOutRd();
   
   AD5940_WUPTCtrl(bFALSE);
@@ -4454,8 +4505,18 @@ AD5940Err AD5940_RAM_FN(AD5940_LFOSCMeasure)(LFOSCMeasure_Type *pCfg, float *pFr
 
   AD5940_INTCClrFlag(AFEINTSRC_ENDSEQ);
   AD5940_WUPTCtrl(bTRUE);
-  AD5940_SPIN_WAIT(AD5940_INTCTestFlag(AFEINTC_1, AFEINTSRC_ENDSEQ) == bFALSE,
-                     return AD5940ERR_TIMEOUT);
+  /* CALLER-PARAMETERISED wait: SeqxSleepTime[0] above is CalDuration*32 LFOSC
+   * ticks, so this spin must last CalDuration milliseconds. The fixed
+   * AD5940_SPIN_GUARD would fire spuriously on healthy hardware for any
+   * CalDuration the API permits -- validation only rejects < 1 ms and ADI's own
+   * examples use ~1000 ms. Derive it: ~100 iterations/ms, doubled for margin,
+   * floored at the default. */
+  {
+    const uint32_t lfosc_guard =
+        (uint32_t)(pCfg->CalDuration * 200.0f) + AD5940_SPIN_GUARD;
+    AD5940_SPIN_WAIT_N(AD5940_INTCTestFlag(AFEINTC_1, AFEINTSRC_ENDSEQ) == bFALSE,
+                       lfosc_guard, LFOSC_TIMEOUT_BAIL());
+  }
   TimerCount2 = AD5940_SEQTimeOutRd();
 	AD5940_INTCTestFlag(AFEINTC_0, AFEINTSRC_ENDSEQ);
 
@@ -4465,6 +4526,7 @@ AD5940Err AD5940_RAM_FN(AD5940_LFOSCMeasure)(LFOSCMeasure_Type *pCfg, float *pFr
   AD5940_INTCClrFlag(AFEINTSRC_ENDSEQ);
   //printf("Time duration:%d ", (TimerCount2 - TimerCount));
 	*pFreq = pCfg->SystemClkFreq*WuptPeriod/(TimerCount2 - TimerCount);
+  #undef LFOSC_TIMEOUT_BAIL
   return AD5940ERR_OK;
 }
 
